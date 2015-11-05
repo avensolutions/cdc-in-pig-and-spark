@@ -1,0 +1,43 @@
+---
+  datasource_name: "testsource"
+  delimited_by: ","
+  cols: 
+    - 
+      colname: "key"
+      colpos: 0
+      coltype: "str"
+      is_key: true
+      last_key: true
+    - 
+      colname: "value1"
+      colpos: 1
+      coltype: "str"
+    - 
+      colname: "value2"
+      colpos: 2
+      coltype: "str"
+    - 
+      colname: "value3"
+      colpos: 3
+      coltype: "str"
+    - 
+      colname: "value4"
+      colpos: 4
+      coltype: "int"
+      last_non_key: true
+  metacols: 
+    rectype: 
+      colpos: 5
+      coltype: "str"
+    effstdate: 
+      colpos: 6
+      coltype: "int"
+    effenddate: 
+      colpos: 7
+      coltype: "int"
+    keyhash: 
+      colpos: 8
+      coltype: "str"
+    valuehash: 
+      colpos: 9
+      coltype: "str"

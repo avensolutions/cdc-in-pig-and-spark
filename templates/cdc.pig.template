@@ -1,0 +1,134 @@
+REGISTER 'cdc_udf.py' USING jython AS cdc_udf;
+{# use path and file name for datafu jar on your platform #}
+REGISTER datafu.jar;
+DEFINE FirstTupleFromBag datafu.pig.bags.FirstTupleFromBag();
+DEFINE MD5 datafu.pig.hash.MD5();
+
+incoming_raw = LOAD '{{ incoming_path }}' USING PigStorage('{{ delimited_by }}');
+current = LOAD '{{ current_path }}' USING PigStorage('{{ delimited_by }}') AS 
+	(
+	{% for col in cols %}col{{ col.colpos }},{% endfor %}
+	col{{ metacols.rectype.colpos }},
+	col{{ metacols.effstdate.colpos }},
+	col{{ metacols.effenddate.colpos }},
+	col{{ metacols.keyhash.colpos }},
+	col{{ metacols.valuehash.colpos }}
+	);
+
+--gets data for each key, assumes no duplicate keys
+key_recs = FOREACH (GROUP incoming_raw BY (
+		{% for col in cols %}{% if col.is_key %}${{ col.colpos }}{% if not col.last_key %},{% endif %}{% endif %}{% endfor %})) {
+	GENERATE TOTUPLE(group) as key_t, FirstTupleFromBag(incoming_raw, null) as all_recs_t;
+}
+
+incoming_kv = FOREACH key_recs GENERATE key_t
+	, ({% for col in cols %}{% if not col.is_key %}all_recs_t.${{ col.colpos }}{% if not col.last_non_key %},{% endif %}{% endif %}{% endfor %}) as val_t
+	, all_recs_t;
+	
+incoming_kv_hash = FOREACH incoming_kv GENERATE
+	MD5(cdc_udf.concat_fields(key_t)) as key_hash
+	,MD5(cdc_udf.concat_fields(val_t)) as value_hash
+	,all_recs_t as all_recs;
+
+incoming = FOREACH incoming_kv_hash GENERATE	
+	key_hash, value_hash, FLATTEN(all_recs) as (
+	{% for col in cols %}col{{ col.colpos }}{% if col.colpos < no_src_cols-1 %},{% endif %}{% endfor %});
+	
+/* incoming with hashes and current data cogrouped */
+cogrouped = COGROUP incoming BY key_hash, current BY ${{ metacols.keyhash.colpos }};
+
+/* NEW RECS */
+new_recs_only = FILTER cogrouped BY IsEmpty(current);
+
+new_recs_flattened = FOREACH new_recs_only GENERATE 
+	FLATTEN(incoming) AS  (
+	key_hash
+	, value_hash
+	{% for col in cols %},col{{ col.colpos }}{% endfor %}
+	);
+
+new_recs_final = FOREACH new_recs_flattened GENERATE	
+	{% for col in cols %}col{{ col.colpos }},{% endfor %}
+		'INSERT' as rectype
+		, {{ ts }} as effstdate
+		, 0 as effenddate
+		, key_hash
+		, value_hash;
+
+--STORE new_recs_final INTO 'working' USING PigStorage(',');	
+
+/* DEL RECS */
+del_recs_only = FILTER cogrouped BY IsEmpty(incoming);
+
+del_recs_flattened = FOREACH del_recs_only GENERATE 
+	FLATTEN(current) AS  (
+	{% for col in cols %}col{{ col.colpos }},{% endfor %} 
+	rectype, 
+	effstdate, 
+	effenddate, 
+	key_hash, 
+	value_hash);
+
+del_recs_final = FOREACH del_recs_flattened GENERATE	
+	{% for col in cols %}col{{ col.colpos }},{% endfor %}
+	'DELETE' as rectype, 
+	effstdate, 
+	{{ ts }} as effenddate, 
+	key_hash, 
+	value_hash;
+
+/* UPD AND UNCHANGED RECS */
+upd_and_unch_recs_only = FILTER cogrouped BY (NOT IsEmpty(incoming) AND NOT IsEmpty(current));
+
+/* */
+upd_and_unch_flattened = FOREACH upd_and_unch_recs_only GENERATE 
+	FLATTEN(incoming) as (
+		incoming_key_hash
+		, incoming_value_hash
+		{% for col in cols %},incoming_col{{ col.colpos }}{% endfor %}
+		),
+	FLATTEN(current) as (
+		{% for col in cols %}current_col{{ col.colpos }},{% endfor %}
+		current_rectype, 
+		current_effstdate, 
+		current_effenddate, 
+		current_key_hash, 
+		current_value_hash);
+	
+SPLIT upd_and_unch_flattened INTO upd_recs_only IF incoming_value_hash != current_value_hash
+	, unchanged_recs_only IF incoming_value_hash == current_value_hash;
+
+upd_recs_new_final = FOREACH upd_recs_only GENERATE
+	{% for col in cols %}incoming_col{{ col.colpos }} as col{{ col.colpos }},{% endfor %}
+	'UPDATE' as rectype, 
+	{{ ts }} as effstdate, 
+	0 as effenddate, 
+	incoming_key_hash as key_hash, 
+	incoming_value_hash as value_hash;
+
+upd_recs_old_final = FOREACH upd_recs_only GENERATE 
+	{% for col in cols %}current_col{{ col.colpos }} as col{{ col.colpos }},{% endfor %}
+	'UPDATE' as rectype, 
+	current_effstdate, 
+	{{ ts }} as effenddate, 
+	current_key_hash as key_hash, 
+	current_value_hash as value_hash;
+
+unchanged_recs_final = FOREACH unchanged_recs_only GENERATE
+	{% for col in cols %}current_col{{ col.colpos }} as col{{ col.colpos }},{% endfor %}
+	current_rectype, 
+	current_effstdate, 
+	current_effenddate, 
+	current_key_hash as key_hash, 
+	current_value_hash as value_hash;
+
+/* union all and save */
+unioned = UNION new_recs_final, del_recs_final, upd_recs_new_final, upd_recs_old_final, unchanged_recs_final;
+
+{% if output_format == "screen" %}
+DUMP unioned;
+{% endif %}	
+
+{% if output_format == "file" %}	
+STORE unioned INTO '{{ output_path }}' USING PigStorage('{{ delimited_by }}');
+{% endif %}

@@ -1,0 +1,134 @@
+{# init Spark context #}
+from pyspark import SparkContext
+from pyspark.sql import SQLContext, Row
+sc = SparkContext()
+sqlContext = SQLContext(sc)
+
+import hashlib
+
+{# load incoming data #}
+incomingRDD = sc.textFile("{{ incoming_path }}")
+try:
+	currentRDD = sqlContext.parquetFile("{{ current_path }}")
+except:	
+	currentRDD = sc.parallelize([])
+
+	
+{# build kv rdds for comparison #}
+incomingRDDkv = incomingRDD.map(lambda line: line.split("{{ delimited_by }}"))\
+	.map(lambda x: ((x[i] for i in ({% for col in cols %}{% if col.is_key %}{{ col.colpos }},{% endif %}{% endfor %})), (x[i] for i in ({% for col in cols %}{% if not col.is_key %}{{ col.colpos }},{% endif %}{% endfor %})), x))\
+	.map(lambda (x, y, z): (hashlib.md5(''.join(x)).hexdigest(), (hashlib.md5(''.join(y)).hexdigest(), z)))
+{# incomingRDDkv schema : [(keyhash, valhash, [recordarr])] #}	
+
+currentRDDkv = currentRDD.map(lambda x: (x[{{ metacols.keyhash.colpos }}], (x[{{ metacols.valuehash.colpos }}], x, x[{{ metacols.effstdate.colpos }}], x[{{ metacols.effenddate.colpos }}])))
+{# currentRDDkv schema : [(keyhash, valhash, [recordarr], effstdate, effenddate)] #}	
+
+allJoined = incomingRDDkv.fullOuterJoin(currentRDDkv)
+
+#
+# find NEW records (INSERT)
+#
+{# allJoined schema for NEW records : [(key, ((inc_v, [inc_rec_arr]), None))] [curr_v is None] #}
+{# map schema : [(x, ((y[0][0], [y[0][1]]), y[1]))] #}	
+newRecs = allJoined.filter(lambda (x, y): y[1] is None)\
+	.map(lambda (x, y): (y[0][1], x, y[0][0]))\
+	.map(lambda (x, y, z): ({% for _ in range(0, no_src_cols) %}x[{{ loop.index0 }}],{% endfor %} 'INSERT', {{ ts }}, 0, y, z))\
+	.map(lambda ({% for _ in range(0, no_src_cols+5) %}x{{ loop.index0 }}{% if loop.index < no_src_cols+5 %},{% endif %}{% endfor %}): ({% for col in cols %}{{ col.coltype }}({% if col.coltype != 'str' %}x{{ col.colpos }} if x{{ col.colpos }} != '' else '0'{% else %}x{{ col.colpos }}{% endif %}),{% endfor %}{{ metacols.rectype.coltype }}(x{{ metacols.rectype.colpos }}),{{ metacols.effstdate.coltype }}(x{{ metacols.effstdate.colpos }}),{{ metacols.effenddate.coltype }}(x{{ metacols.effenddate.colpos }}),{{ metacols.keyhash.coltype }}(x{{ metacols.keyhash.colpos }}),{{ metacols.valuehash.coltype }}(x{{ metacols.valuehash.colpos }})))
+	
+#
+# find REMOVED records (DELETE)
+#
+{# allJoined schema for REMOVED records : [(key, (None, (curr_v, Row(curr_recs), curr_effstdate, curr_effenddate)))] [(inc_v, [inc_rec_arr]) is None] #}
+{# map schema : [(x, (y[0], (y[1][0], Row(y[1][1]), y[1][2], y[1][3])))] #}	
+delRecs = allJoined.filter(lambda (x, y): y[0] is None)\
+	.map(lambda (x, y): (y[1][1]))\
+	.map(lambda (x): ({% for _ in range(0, no_src_cols) %}x[{{ loop.index0 }}],{% endfor %} 'DELETE', x[{{ metacols.effstdate.colpos }}], {{ ts }}, x[{{ metacols.keyhash.colpos }}], x[{{ metacols.valuehash.colpos }}]))
+
+#
+# find CHANGED records (UPDATE)
+#
+{# allJoined schema for CHANGED records : [(key, ((inc_v, [inc_rec_arr]), (curr_v, Row(curr_recs), curr_effstdate, curr_effenddate)))] [inc_v != curr_v] #}
+{# map schema : [(x, ((y[0][0], [y[0][1]]), (y[1][0], Row(y[1][1]), y[1][2], y[1][3])))] #}	
+updRecsNew = allJoined.filter(lambda (x, y): y[0] is not None)\
+	.filter(lambda (x, y): y[1] is not None)\
+	.filter(lambda (x, y): y[0][0] != y[1][0])\
+	.map(lambda (x, y): (y[0][1], x, y[0][0]))\
+	.map(lambda (x, y, z): ({% for _ in range(0, no_src_cols) %}x[{{ loop.index0 }}],{% endfor %} 'UPDATE', {{ ts }}, 0, y, z))\
+	.map(lambda ({% for _ in range(0, no_src_cols+5) %}x{{ loop.index0 }}{% if loop.index < no_src_cols+5 %},{% endif %}{% endfor %}): ({% for col in cols %}{{ col.coltype }}({% if col.coltype != 'str' %}x{{ col.colpos }} if x{{ col.colpos }} != '' else '0'{% else %}x{{ col.colpos }}{% endif %}),{% endfor %}{{ metacols.rectype.coltype }}(x{{ metacols.rectype.colpos }}),{{ metacols.effstdate.coltype }}(x{{ metacols.effstdate.colpos }}),{{ metacols.effenddate.coltype }}(x{{ metacols.effenddate.colpos }}),{{ metacols.keyhash.coltype }}(x{{ metacols.keyhash.colpos }}),{{ metacols.valuehash.coltype }}(x{{ metacols.valuehash.colpos }})))
+	
+updRecsOld = allJoined.filter(lambda (x, y): y[0] is not None)\
+	.filter(lambda (x, y): y[1] is not None)\
+	.filter(lambda (x, y): y[0][0] != y[1][0])\
+	.map(lambda (x, y): (y[1][1]))\
+	.map(lambda (x): ({% for _ in range(0, no_src_cols) %}x[{{ loop.index0 }}],{% endfor %} 'UPDATE', x[{{ metacols.effstdate.colpos }}], {{ ts }}, x[{{ metacols.keyhash.colpos }}], x[{{ metacols.valuehash.colpos }}]))
+
+#
+# find UNCHANGED records
+#
+{# allJoined schema for UNCHANGED records : [(key, ((inc_v, [inc_rec_arr]), (curr_v, Row(curr_recs), curr_effstdate, curr_effenddate)))] [inc_v == curr_v] #}
+{# map schema : [(x, ((y[0][0], [y[0][1]]), (y[1][0], Row(y[1][1]), y[1][2], y[1][3])))] #}	
+unchangedRecs = allJoined.filter(lambda (x, y): y[0] is not None)\
+	.filter(lambda (x, y): y[1] is not None)\
+	.filter(lambda (x, y): y[0][0] == y[1][0])\
+	.map(lambda (x, y): (y[1][1]))\
+	.map(lambda (x): ({% for _ in range(0, no_src_cols+5) %}x[{{ loop.index0 }}]{% if loop.index < no_src_cols+5 %},{% endif %}{% endfor %}))
+
+#
+# check for empty RDDs
+#
+{# if the RDD is not empty the schema is inferred and used for other empty RDDs #}
+if not newRecs.isEmpty():		
+	newRecs_df = sqlContext.inferSchema(newRecs)
+	schema_df = newRecs_df.limit(0)
+
+if not unchangedRecs.isEmpty():
+	unchangedRecs_df = sqlContext.inferSchema(unchangedRecs)
+	schema_df = newRecs_df.limit(0)
+	
+if not delRecs.isEmpty():		
+	delRecs_df = sqlContext.inferSchema(delRecs)
+	schema_df = newRecs_df.limit(0)
+
+if not updRecsNew.isEmpty():	
+	updRecsNew_df = sqlContext.inferSchema(updRecsNew)
+	schema_df = newRecs_df.limit(0)
+
+if not updRecsOld.isEmpty():	
+	updRecsOld_df = sqlContext.inferSchema(updRecsOld)		
+	schema_df = newRecs_df.limit(0)
+
+#	
+# create null RDDs with schema for empty RDDs	
+#
+{# use the reference schema for empty sets #}
+if newRecs.isEmpty():		
+	newRecs_df = schema_df
+
+if unchangedRecs.isEmpty():
+	unchangedRecs_df = schema_df
+	
+if delRecs.isEmpty():		
+	delRecs_df = schema_df
+
+if updRecsNew.isEmpty():	
+	updRecsNew_df = schema_df
+
+if updRecsOld.isEmpty():	
+	updRecsOld_df = schema_df
+	
+# union all
+{# now we can safely union everything #}
+CDCdf = newRecs_df.unionAll(delRecs_df)\
+	.unionAll(updRecsNew_df)\
+	.unionAll(updRecsOld_df)\
+	.unionAll(unchangedRecs_df)
+	
+
+{% if output_format == "screen" %}
+CDCdf.show()
+{% endif %}	
+
+{# save to HDFS as parquetfile #}
+{% if output_format == "file" %}	
+CDCdf.saveAsParquetFile("{{ output_path }}")
+{% endif %}	
