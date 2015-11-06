@@ -95,7 +95,7 @@ else:
 	templated_filename = datasource_name + "_cdc." + str(ts) + ".pig"
 	TEMPLATE_FILE = "cdc.pig.template"
 	
-templateLoader = jinja2.FileSystemLoader( searchpath="." )
+templateLoader = jinja2.FileSystemLoader( searchpath="templates" )
 templateEnv = jinja2.Environment( loader=templateLoader )
 template = templateEnv.get_template( TEMPLATE_FILE )
 

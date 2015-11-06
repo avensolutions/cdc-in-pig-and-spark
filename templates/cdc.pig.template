@@ -1,4 +1,4 @@
-REGISTER 'cdc_udf.py' USING jython AS cdc_udf;
+REGISTER 'lib/cdc_udf.py' USING jython AS cdc_udf;
 {# use path and file name for datafu jar on your platform #}
 REGISTER datafu.jar;
 DEFINE FirstTupleFromBag datafu.pig.bags.FirstTupleFromBag();
